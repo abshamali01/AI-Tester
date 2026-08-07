@@ -3,6 +3,7 @@ Systematic Review Bot v9
 3 Dimensions: D1 Standardization & AI, D2 Context Engineering, D3 Token Efficiency
 PRISMA 2020 + Auto E1/E2/E7 + Year Recovery + Post-fetch Language Check + Word Template
 New: Full authors (no truncation) + Keywords column extracted from all databases
+Patch: Scopus BibTeX support (Scopus export now .bib instead of .csv)
 """
 
 import streamlit as st
@@ -137,6 +138,35 @@ def parse_bib(content, qid):
             keywords=gf("keywords",entry) or gf("keyword",entry)))
     return [p for p in papers if p["title"]]
 
+def parse_scopus_bib(content, qid):
+    """Scopus now exports BibTeX instead of CSV — parse it directly,
+    including abstract + keywords which Scopus BibTeX already includes."""
+    papers = []
+    for entry in re.split(r'\n@', content):
+        if not entry.strip(): continue
+        if not entry.startswith('@'): entry = '@' + entry
+        def gf(field, text):
+            pat = rf'{re.escape(field)}\s*=\s*\{{(.+?)\}}\s*[,\}}]|{re.escape(field)}\s*=\s*"(.+?)"\s*[,\}}]'
+            m = re.search(pat, text, re.IGNORECASE|re.DOTALL)
+            if m: r = m.group(1) if m.group(1) else m.group(2); return r.strip().replace('\n',' ')
+            return ""
+        tag = entry[:30].lower()
+        if "conference" in tag: ptype = "Conference Paper"
+        elif "book" in tag:     ptype = "Book chapter"
+        else:                   ptype = "Article"
+        kw = "; ".join(filter(None,[gf("author_keywords",entry), gf("keywords",entry)]))
+        p = _paper(
+            title=gf("title",entry), authors=gf("author",entry), year=gf("year",entry),
+            source=gf("journal",entry) or gf("booktitle",entry), doi=gf("doi",entry),
+            url=gf("url",entry),
+            ptype=ptype, database="Elsevier/Scopus", query_id=qid, keywords=kw)
+        ab = gf("abstract", entry)
+        if ab:
+            ab = re.sub(r'\s+', ' ', ab).strip()
+            p["abstract"] = ab
+        papers.append(p)
+    return [p for p in papers if p["title"]]
+
 def detect_csv_type(content, fname=""):
     first = content.split('\n')[0].lower()
     second = content.split('\n')[1].lower() if len(content.split('\n')) > 1 else ""
@@ -147,6 +177,13 @@ def detect_csv_type(content, fname=""):
     if "source title" in first: return "scopus"
     if "scopus.com" in second: return "scopus_pop"
     return "scholar"
+
+def is_scopus_bib(content, fname=""):
+    """Detect whether a .bib file is a Scopus export rather than an ACM export."""
+    if "scopus" in fname.lower():
+        return True
+    head = content[:2000].lower()
+    return "source = {scopus}" in head or "scopus.com" in head
 
 # ── Deduplication ─────────────────────────────────────────────────────────────
 def paper_score(p):
@@ -851,12 +888,12 @@ with tab1:
 
     col_h1, col_rst1 = st.columns([4,1])
     with col_h1:
-        st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📁 Step 1 — Upload Files</h3><p style="color:#8b949e;margin-bottom:12px;">Name files like <code>springer_d1q1.csv</code>, <code>acm_d1q2.bib</code>, <code>scopus_d2q1.csv</code>, <code>scholar_d3q1.csv</code></p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📁 Step 1 — Upload Files</h3><p style="color:#8b949e;margin-bottom:12px;">Name files like <code>springer_d1q1.csv</code>, <code>acm_d1q2.bib</code>, <code>scopus_d2q1.bib</code> (or .csv), <code>scholar_d3q1.csv</code></p></div>', unsafe_allow_html=True)
     with col_rst1:
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
         if st.button("🔄 Reset / New Run", key="reset_tab1", use_container_width=True):
             st.session_state.clear(); st.rerun()
-    st.caption("Supports: Springer CSV · Scopus CSV · Google Scholar CSV (Publish or Perish) · ACM BibTeX")
+    st.caption("Supports: Springer CSV · Scopus CSV or BibTeX · Google Scholar CSV (Publish or Perish) · ACM BibTeX")
 
     uploaded = st.file_uploader("Drop all files here", type=["csv","bib"],
                                   accept_multiple_files=True, label_visibility="collapsed")
@@ -872,7 +909,10 @@ with tab1:
                 if q in fname: qid=q.upper(); break
             cf = f.read().decode("utf-8",errors="replace")
             if fname.endswith(".bib"):
-                papers=parse_bib(cf,qid); db="ACM"
+                if is_scopus_bib(cf, fname):
+                    papers=parse_scopus_bib(cf,qid); db="Elsevier/Scopus"
+                else:
+                    papers=parse_bib(cf,qid); db="ACM"
             else:
                 ctype=detect_csv_type(cf,fname)
                 if ctype=="springer":         papers=parse_springer_csv(cf,qid);   db="Springer"
@@ -1021,12 +1061,12 @@ with tab1:
         st.markdown("---")
         st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📋 File Naming Convention</h3></div>',unsafe_allow_html=True)
         st.dataframe(pd.DataFrame({
-            "File":  ["springer_d1q1.csv","springer_d1q2.csv","acm_d1q1.bib","acm_d1q2.bib","scopus_d2q1.csv","scholar_d3q1.csv"],
+            "File":  ["springer_d1q1.csv","springer_d1q2.csv","acm_d1q1.bib","acm_d1q2.bib","scopus_d2q1.bib","scholar_d3q1.csv"],
             "DB":    ["Springer","Springer","ACM","ACM","Elsevier/Scopus","Google Scholar"],
             "Query": ["D1Q1","D1Q2","D1Q1","D1Q2","D2Q1","D3Q1"],
-            "Format":["CSV","CSV","BibTeX","BibTeX","CSV","CSV"],
+            "Format":["CSV","CSV","BibTeX","BibTeX","BibTeX (or CSV)","CSV"],
         }),use_container_width=True,hide_index=True)
-        st.info("💡 Query ID (d1q1, d2q2 etc.) must be in filename.")
+        st.info("💡 Query ID (d1q1, d2q2 etc.) must be in filename. Scopus exports as BibTeX are auto-detected.")
 
 with tab2:
     st.markdown("""
@@ -1251,7 +1291,7 @@ with tab3:
 
     col_gh, col_gr = st.columns([4,1])
     with col_gh:
-        st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📁 Upload Files</h3><p style="color:#8b949e;margin-bottom:8px;">Name files with database prefix: <code>springer_*.csv</code>, <code>scopus_*.csv</code>, <code>scholar_*.csv</code>, <code>acm_*.bib</code><br>No query ID required.</p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📁 Upload Files</h3><p style="color:#8b949e;margin-bottom:8px;">Name files with database prefix: <code>springer_*.csv</code>, <code>scopus_*.csv</code> or <code>scopus_*.bib</code>, <code>scholar_*.csv</code>, <code>acm_*.bib</code><br>No query ID required.</p></div>', unsafe_allow_html=True)
     with col_gr:
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
         if st.button("🔄 Reset", key="reset_tab3", use_container_width=True):
@@ -1259,7 +1299,7 @@ with tab3:
                 if k.startswith("g3_"): del st.session_state[k]
             st.rerun()
 
-    st.caption("Supports: Springer CSV · Scopus CSV · Google Scholar CSV · ACM BibTeX")
+    st.caption("Supports: Springer CSV · Scopus CSV or BibTeX · Google Scholar CSV · ACM BibTeX")
 
     g3_uploaded = st.file_uploader("Drop files here", type=["csv","bib"],
                                     accept_multiple_files=True,
@@ -1313,6 +1353,33 @@ with tab3:
             except: pass
             return papers
 
+        def g3_parse_scopus_bib(content):
+            """Scopus BibTeX export parser for the Generic Importer tab."""
+            papers = []
+            for entry in _re3.split(r'\n@', content):
+                if not entry.strip(): continue
+                if not entry.startswith('@'): entry = '@' + entry
+                def gf(field, text):
+                    pat = rf'{_re3.escape(field)}\s*=\s*\{{(.+?)\}}\s*[,\}}]|{_re3.escape(field)}\s*=\s*"(.+?)"\s*[,\}}]'
+                    m = _re3.search(pat, text, _re3.IGNORECASE|_re3.DOTALL)
+                    if m: r = m.group(1) if m.group(1) else m.group(2); return r.strip().replace('\n',' ')
+                    return ""
+                tag = entry[:30].lower()
+                if "conference" in tag: ptype = "Conference Paper"
+                elif "book" in tag:     ptype = "Book chapter"
+                else:                   ptype = "Article"
+                kw = "; ".join(filter(None,[gf("author_keywords",entry), gf("keywords",entry)]))
+                p = g3_paper(
+                    title=gf("title",entry), authors=gf("author",entry), year=gf("year",entry),
+                    source=gf("journal",entry) or gf("booktitle",entry), doi=gf("doi",entry),
+                    url=gf("url",entry), ptype=ptype, database="Scopus", keywords=kw)
+                ab = gf("abstract", entry)
+                if ab:
+                    ab = _re3.sub(r'\s+', ' ', ab).strip()
+                    p["abstract"] = ab
+                papers.append(p)
+            return [p for p in papers if p["title"]]
+
         def g3_parse_scholar(content):
             papers = []
             try:
@@ -1359,6 +1426,11 @@ with tab3:
             if "source title" in first: return "scopus"
             if "scopus.com" in second: return "scopus"
             return "scholar"
+
+        def g3_is_scopus_bib(content, fname=""):
+            if "scopus" in fname.lower(): return True
+            head = content[:2000].lower()
+            return "source = {scopus}" in head or "scopus.com" in head
 
         def g3_dedup(papers):
             sorted_p = sorted(papers, key=lambda p: (
@@ -1412,7 +1484,10 @@ with tab3:
             fname = f.name.lower()
             cf = f.read().decode("utf-8", errors="replace")
             if fname.endswith(".bib"):
-                papers = g3_parse_bib(cf); db = "ACM"
+                if g3_is_scopus_bib(cf, fname):
+                    papers = g3_parse_scopus_bib(cf); db = "Scopus"
+                else:
+                    papers = g3_parse_bib(cf); db = "ACM"
             else:
                 ctype = g3_detect(cf, fname)
                 if ctype == "springer":   papers = g3_parse_springer(cf); db = "Springer"
