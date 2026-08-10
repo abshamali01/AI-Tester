@@ -1683,12 +1683,19 @@ with tab3:
             workers3 = st.slider("Concurrent workers", 1, 5, 3, key="g3_workers")
 
         if st.button("🚀 Generate Workbook", type="primary", use_container_width=True, key="g3_generate"):
-            need3 = [p for p in pending3 if p.get("doi","") or p.get("url","")]
+            # Only fetch papers actually missing something — skip if abstract+title+authors+keywords all present
+            need3 = [p for p in pending3
+                     if (p.get("doi","") or p.get("url",""))
+                     and not (p.get("abstract","").strip() and
+                              p.get("title","").strip() and
+                              p.get("authors","").strip() and
+                              p.get("keywords","").strip())]
+            skipped3 = len(pending3) - len(need3)
             prog3 = st.progress(0); s3 = st.empty(); d3 = st.empty()
 
             if fetch3 and need3:
                 t0 = time.time(); total3 = len(need3); found3 = done3 = 0
-                s3.markdown("🔄 **Fetching abstracts...**")
+                s3.markdown(f"🔄 **Fetching for {len(need3)} papers** (⏭️ {skipped3} already complete — skipped)")
 
                 def fetch3_one(ip):
                     i,p = ip
