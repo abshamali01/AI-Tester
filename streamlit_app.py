@@ -1692,13 +1692,13 @@ with tab3:
 
                 def fetch3_one(ip):
                     i,p = ip
-                    ab, kw, au = fetch_abstract_keywords_authors_for_paper(p)
-                    return i, ab, kw, au
+                    ab, kw, ab_src = fetch_abstract_and_keywords_for_paper(p)
+                    return i, ab, kw, ab_src
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=workers3) as ex:
                     futs = {ex.submit(fetch3_one,(i,p)):i for i,p in enumerate(need3)}
                     for fut in concurrent.futures.as_completed(futs):
-                        idx,ab,kw,au = fut.result()
+                        idx,ab,kw,ab_src = fut.result()
                         if ab:
                             need3[idx]["abstract"]=ab
                             need3[idx]["abstract_source"]=ab_src
@@ -1708,7 +1708,6 @@ with tab3:
                             need3[idx]["abstract_source"]=ab_src
                             need3[idx]["metadata_status"]="Not available — manual check"
                         if kw and not need3[idx].get("keywords",""): need3[idx]["keywords"]=kw
-                        if au and _author_count(au) > _author_count(need3[idx].get("authors","")): need3[idx]["authors"]=au
                         done3+=1
                         pct=int(done3/total3*100); prog3.progress(pct/100)
                         elapsed=time.time()-t0; rate=done3/elapsed if elapsed>0 else 1
