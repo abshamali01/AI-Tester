@@ -117,7 +117,18 @@ def parse_scholar_csv(content, qid):
     except Exception as e: st.warning(f"Scholar parse error: {e}")
     return papers
 
-def parse_bib(content, qid):
+def _detect_bib_source(content, fname=""):
+    """Detect whether a BIB file is from Scopus or ACM."""
+    fname_l = fname.lower()
+    if "scopus" in fname_l: return "Elsevier/Scopus"
+    # Scopus BIB files have 'document_type' and 'source' fields, and often 'affiliation'
+    markers = ["document_type", "affiliation", "coden", "language of original document"]
+    content_l = content[:3000].lower()
+    if sum(1 for m in markers if m in content_l) >= 2: return "Elsevier/Scopus"
+    return "ACM"
+
+def parse_bib(content, qid, database=None):
+    """Parse BibTeX from ACM or Scopus. Auto-detects source if database not provided."""
     papers = []
     for entry in re.split(r'\n@', content):
         if not entry.strip(): continue
@@ -127,17 +138,19 @@ def parse_bib(content, qid):
             m = re.search(pat, text, re.IGNORECASE|re.DOTALL)
             if m: r = m.group(1) if m.group(1) else m.group(2); return r.strip().replace('\n',' ')
             return ""
+        db = database or "ACM"
         p = _paper(
             title=gf("title",entry), authors=gf("author",entry), year=gf("year",entry),
-            source=gf("booktitle",entry) or gf("journal",entry), doi=gf("doi",entry),
-            url=gf("url",entry),
-            ptype="Conference Paper" if "inproceedings" in entry[:30].lower() else "Article",
-            database="ACM", query_id=qid,
-            keywords=gf("keywords",entry) or gf("keyword",entry))
+            source=gf("booktitle",entry) or gf("journal",entry) or gf("source",entry),
+            doi=gf("doi",entry), url=gf("url",entry),
+            ptype=gf("document_type",entry) or ("Conference Paper" if "inproceedings" in entry[:30].lower() else "Article"),
+            database=db, query_id=qid,
+            keywords=gf("keywords",entry) or gf("keyword",entry) or gf("author_keywords",entry))
         ab = gf("abstract", entry)
         if ab:
             p["abstract"] = _clean(re.sub(r'\s+', ' ', ab).strip())
-            p["abstract_source"] = "ACM BibTeX export"
+            p["abstract_source"] = f"{db} BibTeX export"
+            p["metadata_status"] = "Original"
         papers.append(p)
     return [p for p in papers if p["title"]]
 
@@ -1011,7 +1024,7 @@ with tab1:
 
     col_h1, col_rst1 = st.columns([4,1])
     with col_h1:
-        st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📁 Step 1 — Upload Files</h3><p style="color:#8b949e;margin-bottom:12px;">Name files like <code>springer_d1q1.csv</code>, <code>acm_d1q2.bib</code>, <code>scopus_d2q1.csv</code>, <code>scholar_d3q1.csv</code></p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📁 Step 1 — Upload Files</h3><p style="color:#8b949e;margin-bottom:12px;">Name files like <code>springer_d1q1.csv</code>, <code>acm_d1q2.bib</code>, <code>scopus_d2q1.csv</code> or <code>scopus_d2q1.bib</code>, <code>scholar_d3q1.csv</code></p></div>', unsafe_allow_html=True)
     with col_rst1:
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
         if st.button("🔄 Reset / New Run", key="reset_tab1", use_container_width=True):
@@ -1038,7 +1051,8 @@ with tab1:
                 if q in fname: qid=q.upper(); break
             cf = f.read().decode("utf-8",errors="replace")
             if fname.endswith(".bib"):
-                papers=parse_bib(cf,qid); db="ACM"
+                db=_detect_bib_source(cf,fname)
+                papers=parse_bib(cf,qid,database=db)
             else:
                 ctype=detect_csv_type(cf,fname)
                 if ctype=="springer":         papers=parse_springer_csv(cf,qid);   db="Springer"
@@ -1234,10 +1248,10 @@ with tab1:
         st.markdown("---")
         st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📋 File Naming Convention</h3></div>',unsafe_allow_html=True)
         st.dataframe(pd.DataFrame({
-            "File":  ["springer_d1q1.csv","springer_d1q2.csv","acm_d1q1.bib","acm_d1q2.bib","scopus_d2q1.csv","scholar_d3q1.csv"],
-            "DB":    ["Springer","Springer","ACM","ACM","Elsevier/Scopus","Google Scholar"],
-            "Query": ["D1Q1","D1Q2","D1Q1","D1Q2","D2Q1","D3Q1"],
-            "Format":["CSV","CSV","BibTeX","BibTeX","CSV","CSV"],
+            "File":  ["springer_d1q1.csv","acm_d1q1.bib","scopus_d2q1.csv","scopus_d2q1.bib","scholar_d3q1.csv"],
+            "DB":    ["Springer","ACM","Elsevier/Scopus","Elsevier/Scopus","Google Scholar"],
+            "Query": ["D1Q1","D1Q1","D2Q1","D2Q1","D3Q1"],
+            "Format":["CSV","BibTeX","CSV","BibTeX","CSV"],
         }),use_container_width=True,hide_index=True)
         st.info("💡 Query ID (d1q1, d2q2 etc.) must be in filename.")
 
@@ -1479,7 +1493,7 @@ with tab3:
 
     col_gh, col_gr = st.columns([4,1])
     with col_gh:
-        st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📁 Upload Files</h3><p style="color:#8b949e;margin-bottom:8px;">Name files with database prefix: <code>springer_*.csv</code>, <code>scopus_*.csv</code>, <code>scholar_*.csv</code>, <code>acm_*.bib</code><br>No query ID required.</p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📁 Upload Files</h3><p style="color:#8b949e;margin-bottom:8px;">Name files with database prefix: <code>springer_*.csv</code>, <code>scopus_*.csv</code> or <code>scopus_*.bib</code>, <code>scholar_*.csv</code>, <code>acm_*.bib</code><br>No query ID required.</p></div>', unsafe_allow_html=True)
     with col_gr:
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
         if st.button("🔄 Reset", key="reset_tab3", use_container_width=True):
@@ -1561,7 +1575,7 @@ with tab3:
             except: pass
             return papers
 
-        def g3_parse_bib(content):
+        def g3_parse_bib(content, database="ACM"):
             papers = []
             for entry in _re3.split(r'\n@', content):
                 if not entry.strip(): continue
@@ -1571,13 +1585,16 @@ with tab3:
                     m = _re3.search(pat, text, _re3.IGNORECASE|_re3.DOTALL)
                     if m: r = m.group(1) if m.group(1) else m.group(2); return r.strip().replace('\n',' ')
                     return ""
-                papers.append(g3_paper(
+                p = g3_paper(
                     title=gf("title",entry), authors=gf("author",entry), year=gf("year",entry),
-                    source=gf("booktitle",entry) or gf("journal",entry), doi=gf("doi",entry),
-                    url=gf("url",entry),
-                    ptype="Conference Paper" if "inproceedings" in entry[:30].lower() else "Article",
-                    database="ACM",
-                    keywords=gf("keywords",entry) or gf("keyword",entry)))
+                    source=gf("booktitle",entry) or gf("journal",entry) or gf("source",entry),
+                    doi=gf("doi",entry), url=gf("url",entry),
+                    ptype=gf("document_type",entry) or ("Conference Paper" if "inproceedings" in entry[:30].lower() else "Article"),
+                    database=database,
+                    keywords=gf("keywords",entry) or gf("keyword",entry) or gf("author_keywords",entry))
+                ab = gf("abstract", entry)
+                if ab: p["abstract"] = ab.strip(); p["abstract_source"] = f"{database} BibTeX export"
+                papers.append(p)
             return [p for p in papers if p["title"]]
 
         def g3_detect(content, fname):
@@ -1645,7 +1662,8 @@ with tab3:
             fname = f.name.lower()
             cf = f.read().decode("utf-8", errors="replace")
             if fname.endswith(".bib"):
-                papers = g3_parse_bib(cf); db = "ACM"
+                db = _detect_bib_source(cf, fname)
+                papers = g3_parse_bib(cf, db)
             else:
                 ctype = g3_detect(cf, fname)
                 if ctype == "springer":   papers = g3_parse_springer(cf); db = "Springer"
