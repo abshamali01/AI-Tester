@@ -3,7 +3,6 @@ Systematic Review Bot v9
 3 Dimensions: D1 Standardization & AI, D2 Context Engineering, D3 Token Efficiency
 PRISMA 2020 + Auto E1/E2/E7 + Year Recovery + Post-fetch Language Check + Word Template
 New: Full authors (no truncation) + Keywords column extracted from all databases
-Patch: Scopus BibTeX support (Scopus export now .bib instead of .csv)
 """
 
 import streamlit as st
@@ -46,7 +45,6 @@ def _paper(title="", authors="", year="", source="", doi="", url="", ptype="",
         "dimension": QUERY_MAP.get(query_id, ""),
         "keywords": keywords,
         "screening_status": "Pending", "exclusion_reason": "", "notes": "",
-        "relevanz": "", "themenbereich": "", "art_der_quelle": "",   # NEW
         "auto_excluded": False,
     }
 
@@ -129,41 +127,15 @@ def parse_bib(content, qid):
             m = re.search(pat, text, re.IGNORECASE|re.DOTALL)
             if m: r = m.group(1) if m.group(1) else m.group(2); return r.strip().replace('\n',' ')
             return ""
-        papers.append(_paper(
+        p = _paper(
             title=gf("title",entry), authors=gf("author",entry), year=gf("year",entry),
             source=gf("booktitle",entry) or gf("journal",entry), doi=gf("doi",entry),
             url=gf("url",entry),
             ptype="Conference Paper" if "inproceedings" in entry[:30].lower() else "Article",
             database="ACM", query_id=qid,
-            keywords=gf("keywords",entry) or gf("keyword",entry)))
-    return [p for p in papers if p["title"]]
-
-def parse_scopus_bib(content, qid):
-    """Scopus now exports BibTeX instead of CSV — parse it directly,
-    including abstract + keywords which Scopus BibTeX already includes."""
-    papers = []
-    for entry in re.split(r'\n@', content):
-        if not entry.strip(): continue
-        if not entry.startswith('@'): entry = '@' + entry
-        def gf(field, text):
-            pat = rf'{re.escape(field)}\s*=\s*\{{(.+?)\}}\s*[,\}}]|{re.escape(field)}\s*=\s*"(.+?)"\s*[,\}}]'
-            m = re.search(pat, text, re.IGNORECASE|re.DOTALL)
-            if m: r = m.group(1) if m.group(1) else m.group(2); return r.strip().replace('\n',' ')
-            return ""
-        tag = entry[:30].lower()
-        if "conference" in tag: ptype = "Conference Paper"
-        elif "book" in tag:     ptype = "Book chapter"
-        else:                   ptype = "Article"
-        kw = "; ".join(filter(None,[gf("author_keywords",entry), gf("keywords",entry)]))
-        p = _paper(
-            title=gf("title",entry), authors=gf("author",entry), year=gf("year",entry),
-            source=gf("journal",entry) or gf("booktitle",entry), doi=gf("doi",entry),
-            url=gf("url",entry),
-            ptype=ptype, database="Elsevier/Scopus", query_id=qid, keywords=kw)
+            keywords=gf("keywords",entry) or gf("keyword",entry))
         ab = gf("abstract", entry)
-        if ab:
-            ab = re.sub(r'\s+', ' ', ab).strip()
-            p["abstract"] = ab
+        if ab: p["abstract"] = _clean(re.sub(r'\s+', ' ', ab).strip())
         papers.append(p)
     return [p for p in papers if p["title"]]
 
@@ -177,13 +149,6 @@ def detect_csv_type(content, fname=""):
     if "source title" in first: return "scopus"
     if "scopus.com" in second: return "scopus_pop"
     return "scholar"
-
-def is_scopus_bib(content, fname=""):
-    """Detect whether a .bib file is a Scopus export rather than an ACM export."""
-    if "scopus" in fname.lower():
-        return True
-    head = content[:2000].lower()
-    return "source = {scopus}" in head or "scopus.com" in head
 
 # ── Deduplication ─────────────────────────────────────────────────────────────
 def paper_score(p):
@@ -201,11 +166,10 @@ def deduplicate(papers):
     for p in sorted_p:
         doi   = p.get("doi","").strip().lower()
         title = p.get("title","").strip().lower()[:120]
-        if doi:
-            if doi in seen_doi: dupes.append(p); continue
-            seen_doi.add(doi)
-        else:
-            if title and title in seen_title: dupes.append(p); continue
+        # Duplicate if: same DOI OR same title (regardless of whether DOI present)
+        is_dup = (doi and doi in seen_doi) or (title and title in seen_title)
+        if is_dup: dupes.append(p); continue
+        if doi:   seen_doi.add(doi)
         if title: seen_title.add(title)
         unique.append(p)
     return unique, dupes
@@ -540,9 +504,9 @@ def auto_screen(papers):
                      notes=f"Auto: not English — {reason}", auto_excluded=True)
             counts["E2"] += 1; continue
 
-        if not p.get("title","").strip() or not p.get("authors","").strip():
+        if not p.get("title","").strip():
             p.update(screening_status="Exclude", exclusion_reason="E7",
-                     notes="Auto: missing title or authors", auto_excluded=True)
+                     notes="Auto: missing title", auto_excluded=True)
             counts["E7"] += 1
 
     return papers, counts
@@ -587,7 +551,6 @@ def build_dimension_excel(papers, dupe_list, dim_code, dim_name):
     wb = openpyxl.Workbook()
 
     # ── Column definitions — now includes Authors (full) + Keywords ──
-    # ── Column definitions — now includes Authors (full) + Keywords + Relevanz/Themenbereich/Art der Quelle ──
     COLS = [
         ("Database",       14),
         ("Title",          50),
@@ -596,14 +559,11 @@ def build_dimension_excel(papers, dupe_list, dim_code, dim_name):
         ("Source / Journal",26),
         ("DOI",            28),
         ("URL",            28),
-        ("Keywords",       35),
+        ("Keywords",       35),   # NEW
         ("Abstract",       60),
         ("Screening Status",14),
         ("Exclusion Reason",20),
         ("Notes",          30),
-        ("Relevanz",       12),   # NEW: Hoch / Mittel / Niedrig
-        ("Themenbereich",  25),   # NEW: free text
-        ("Art der Quelle", 22),   # NEW: dropdown
     ]
 
     def write_screen(ws, plist, rfn=None, start=1):
@@ -629,9 +589,6 @@ def build_dimension_excel(papers, dupe_list, dim_code, dim_name):
                 p.get("screening_status","Pending"),
                 p.get("exclusion_reason",""),
                 p.get("notes",""),
-                p.get("relevanz",""),           # NEW
-                p.get("themenbereich",""),      # NEW
-                p.get("art_der_quelle",""),     # NEW
             ]
             for ci,val in enumerate(vals,1):
                 c=ws.cell(row=ri,column=ci,value=val)
@@ -643,12 +600,6 @@ def build_dimension_excel(papers, dupe_list, dim_code, dim_name):
             ws.add_data_validation(dv1); dv1.add(f'J{start+1}:J{start+len(plist)}')
             dv2=DataValidation(type="list",formula1='"E1,E2,E3,E4,E5,E6,E7,E8,E9,"',allow_blank=True)
             ws.add_data_validation(dv2); dv2.add(f'K{start+1}:K{start+len(plist)}')
-            # NEW: Relevanz dropdown -> column M (13th)
-            dv3=DataValidation(type="list",formula1='"Hoch,Mittel,Niedrig"',allow_blank=True)
-            ws.add_data_validation(dv3); dv3.add(f'M{start+1}:M{start+len(plist)}')
-            # NEW: Art der Quelle dropdown -> column O (15th)
-            dv4=DataValidation(type="list",formula1='"Research Article,Journal,Conference Paper,Peer Reviewed Paper,Short Paper,Other"',allow_blank=True)
-            ws.add_data_validation(dv4); dv4.add(f'O{start+1}:O{start+len(plist)}')
 
     # Sheet 1: PRISMA
     ws=wb.active; ws.title="PRISMA_Flow"; ws.sheet_view.showGridLines=False
@@ -888,12 +839,12 @@ with tab1:
 
     col_h1, col_rst1 = st.columns([4,1])
     with col_h1:
-        st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📁 Step 1 — Upload Files</h3><p style="color:#8b949e;margin-bottom:12px;">Name files like <code>springer_d1q1.csv</code>, <code>acm_d1q2.bib</code>, <code>scopus_d2q1.bib</code> (or .csv), <code>scholar_d3q1.csv</code></p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📁 Step 1 — Upload Files</h3><p style="color:#8b949e;margin-bottom:12px;">Name files like <code>springer_d1q1.csv</code>, <code>acm_d1q2.bib</code>, <code>scopus_d2q1.csv</code>, <code>scholar_d3q1.csv</code></p></div>', unsafe_allow_html=True)
     with col_rst1:
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
         if st.button("🔄 Reset / New Run", key="reset_tab1", use_container_width=True):
             st.session_state.clear(); st.rerun()
-    st.caption("Supports: Springer CSV · Scopus CSV or BibTeX · Google Scholar CSV (Publish or Perish) · ACM BibTeX")
+    st.caption("Supports: Springer CSV · Scopus CSV · Google Scholar CSV (Publish or Perish) · ACM BibTeX")
 
     uploaded = st.file_uploader("Drop all files here", type=["csv","bib"],
                                   accept_multiple_files=True, label_visibility="collapsed")
@@ -909,10 +860,7 @@ with tab1:
                 if q in fname: qid=q.upper(); break
             cf = f.read().decode("utf-8",errors="replace")
             if fname.endswith(".bib"):
-                if is_scopus_bib(cf, fname):
-                    papers=parse_scopus_bib(cf,qid); db="Elsevier/Scopus"
-                else:
-                    papers=parse_bib(cf,qid); db="ACM"
+                papers=parse_bib(cf,qid); db="ACM"
             else:
                 ctype=detect_csv_type(cf,fname)
                 if ctype=="springer":         papers=parse_springer_csv(cf,qid);   db="Springer"
@@ -997,7 +945,12 @@ with tab1:
                         d_txt.markdown(f"**{pct}%** · ⏱ {m}m {s}s remaining · ✅ {found} fetched · {completed}/{total}")
 
                 for idx,(abstract,keywords) in results.items():
-                    if abstract: need_abstract[idx]["abstract"]=abstract
+                    if abstract:
+                        need_abstract[idx]["abstract"]=abstract
+                        need_abstract[idx]["abstract_source"]="API/web (CrossRef/S2/OpenAlex)"
+                        need_abstract[idx]["metadata_status"]="Recovered"
+                    else:
+                        need_abstract[idx]["metadata_status"]="Not available — manual check"
                     if keywords and not need_abstract[idx].get("keywords",""):
                         need_abstract[idx]["keywords"]=keywords
 
@@ -1061,12 +1014,12 @@ with tab1:
         st.markdown("---")
         st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📋 File Naming Convention</h3></div>',unsafe_allow_html=True)
         st.dataframe(pd.DataFrame({
-            "File":  ["springer_d1q1.csv","springer_d1q2.csv","acm_d1q1.bib","acm_d1q2.bib","scopus_d2q1.bib","scholar_d3q1.csv"],
+            "File":  ["springer_d1q1.csv","springer_d1q2.csv","acm_d1q1.bib","acm_d1q2.bib","scopus_d2q1.csv","scholar_d3q1.csv"],
             "DB":    ["Springer","Springer","ACM","ACM","Elsevier/Scopus","Google Scholar"],
             "Query": ["D1Q1","D1Q2","D1Q1","D1Q2","D2Q1","D3Q1"],
-            "Format":["CSV","CSV","BibTeX","BibTeX","BibTeX (or CSV)","CSV"],
+            "Format":["CSV","CSV","BibTeX","BibTeX","CSV","CSV"],
         }),use_container_width=True,hide_index=True)
-        st.info("💡 Query ID (d1q1, d2q2 etc.) must be in filename. Scopus exports as BibTeX are auto-detected.")
+        st.info("💡 Query ID (d1q1, d2q2 etc.) must be in filename.")
 
 with tab2:
     st.markdown("""
@@ -1136,17 +1089,32 @@ with tab2:
         return expanded
 
     def screen_paper(title, abstract, keywords):
+        """
+        Keyword screener — outputs relevance flag, not auto-exclusion.
+        Having no keyword match is NOT grounds for E4 exclusion;
+        it flags the paper for manual review (Pending).
+        Only if both title + abstract are present AND zero hits → mark Pending (low relevance).
+        Researcher makes final Include/Exclude decision based on eligibility criteria.
+        """
         has_title    = bool(title.strip())
         has_abstract = bool(abstract.strip())
         title_hits    = [kw for kw in keywords if kw in title.lower()]    if has_title    else []
         abstract_hits = [kw for kw in keywords if kw in abstract.lower()] if has_abstract else []
         all_hits = list(set(title_hits + abstract_hits))
+
         if has_title and has_abstract:
-            if all_hits: return "Include", "", f"Match in title+abstract: {', '.join(all_hits[:5])}"
-            else:        return "Exclude", "E4", "No keyword match in title or abstract"
+            if all_hits:
+                n = len(all_hits)
+                relevance = "High" if n >= 3 else ("Medium" if n >= 1 else "Low")
+                return "Include", "", f"[{relevance} relevance] Match: {', '.join(all_hits[:5])}"
+            else:
+                # No hits — flag for manual review, do NOT auto-exclude
+                return "Pending", "", "No keyword match in title or abstract — manual eligibility check required"
         elif has_title and not has_abstract:
-            if title_hits: return "Include", "", f"Match in title: {', '.join(title_hits[:5])}"
-            else:          return "Pending", "", "No title keyword match — abstract missing, check manually"
+            if title_hits:
+                return "Include", "", f"Match in title: {', '.join(title_hits[:5])} (abstract missing)"
+            else:
+                return "Pending", "", "No title keyword match — abstract missing, check manually"
         else:
             return "Pending", "", "No title or abstract — check manually"
 
@@ -1291,7 +1259,7 @@ with tab3:
 
     col_gh, col_gr = st.columns([4,1])
     with col_gh:
-        st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📁 Upload Files</h3><p style="color:#8b949e;margin-bottom:8px;">Name files with database prefix: <code>springer_*.csv</code>, <code>scopus_*.csv</code> or <code>scopus_*.bib</code>, <code>scholar_*.csv</code>, <code>acm_*.bib</code><br>No query ID required.</p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📁 Upload Files</h3><p style="color:#8b949e;margin-bottom:8px;">Name files with database prefix: <code>springer_*.csv</code>, <code>scopus_*.csv</code>, <code>scholar_*.csv</code>, <code>acm_*.bib</code><br>No query ID required.</p></div>', unsafe_allow_html=True)
     with col_gr:
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
         if st.button("🔄 Reset", key="reset_tab3", use_container_width=True):
@@ -1299,7 +1267,7 @@ with tab3:
                 if k.startswith("g3_"): del st.session_state[k]
             st.rerun()
 
-    st.caption("Supports: Springer CSV · Scopus CSV or BibTeX · Google Scholar CSV · ACM BibTeX")
+    st.caption("Supports: Springer CSV · Scopus CSV · Google Scholar CSV · ACM BibTeX")
 
     g3_uploaded = st.file_uploader("Drop files here", type=["csv","bib"],
                                     accept_multiple_files=True,
@@ -1308,15 +1276,14 @@ with tab3:
     if g3_uploaded:
         # ── Parse ────────────────────────────────────────────────────────────
         def g3_paper(title="", authors="", year="", source="", doi="", url="",
-             ptype="", database="", keywords=""):
-                return {
-                    "title": title, "authors": authors, "year": str(year),
-                    "source": source, "doi": doi, "abstract": "", "url": url,
-                    "type": ptype, "database": database, "keywords": keywords,
-                    "screening_status": "Pending", "exclusion_reason": "", "notes": "",
-                    "relevanz": "", "themenbereich": "", "art_der_quelle": "",   # NEW
-                    "auto_excluded": False,
-                }
+                     ptype="", database="", keywords=""):
+            return {
+                "title": title, "authors": authors, "year": str(year),
+                "source": source, "doi": doi, "abstract": "", "url": url,
+                "type": ptype, "database": database, "keywords": keywords,
+                "screening_status": "Pending", "exclusion_reason": "", "notes": "",
+                "auto_excluded": False,
+            }
 
         def g3_parse_springer(content):
             papers = []
@@ -1352,33 +1319,6 @@ with tab3:
                         keywords=kw or row.get("Keywords","").strip()))
             except: pass
             return papers
-
-        def g3_parse_scopus_bib(content):
-            """Scopus BibTeX export parser for the Generic Importer tab."""
-            papers = []
-            for entry in _re3.split(r'\n@', content):
-                if not entry.strip(): continue
-                if not entry.startswith('@'): entry = '@' + entry
-                def gf(field, text):
-                    pat = rf'{_re3.escape(field)}\s*=\s*\{{(.+?)\}}\s*[,\}}]|{_re3.escape(field)}\s*=\s*"(.+?)"\s*[,\}}]'
-                    m = _re3.search(pat, text, _re3.IGNORECASE|_re3.DOTALL)
-                    if m: r = m.group(1) if m.group(1) else m.group(2); return r.strip().replace('\n',' ')
-                    return ""
-                tag = entry[:30].lower()
-                if "conference" in tag: ptype = "Conference Paper"
-                elif "book" in tag:     ptype = "Book chapter"
-                else:                   ptype = "Article"
-                kw = "; ".join(filter(None,[gf("author_keywords",entry), gf("keywords",entry)]))
-                p = g3_paper(
-                    title=gf("title",entry), authors=gf("author",entry), year=gf("year",entry),
-                    source=gf("journal",entry) or gf("booktitle",entry), doi=gf("doi",entry),
-                    url=gf("url",entry), ptype=ptype, database="Scopus", keywords=kw)
-                ab = gf("abstract", entry)
-                if ab:
-                    ab = _re3.sub(r'\s+', ' ', ab).strip()
-                    p["abstract"] = ab
-                papers.append(p)
-            return [p for p in papers if p["title"]]
 
         def g3_parse_scholar(content):
             papers = []
@@ -1426,11 +1366,6 @@ with tab3:
             if "source title" in first: return "scopus"
             if "scopus.com" in second: return "scopus"
             return "scholar"
-
-        def g3_is_scopus_bib(content, fname=""):
-            if "scopus" in fname.lower(): return True
-            head = content[:2000].lower()
-            return "source = {scopus}" in head or "scopus.com" in head
 
         def g3_dedup(papers):
             sorted_p = sorted(papers, key=lambda p: (
@@ -1484,10 +1419,7 @@ with tab3:
             fname = f.name.lower()
             cf = f.read().decode("utf-8", errors="replace")
             if fname.endswith(".bib"):
-                if g3_is_scopus_bib(cf, fname):
-                    papers = g3_parse_scopus_bib(cf); db = "Scopus"
-                else:
-                    papers = g3_parse_bib(cf); db = "ACM"
+                papers = g3_parse_bib(cf); db = "ACM"
             else:
                 ctype = g3_detect(cf, fname)
                 if ctype == "springer":   papers = g3_parse_springer(cf); db = "Springer"
@@ -1539,35 +1471,21 @@ with tab3:
                 s3.markdown("🔄 **Fetching abstracts...**")
 
                 def fetch3_one(ip):
-                    i, p = ip
-                    ab, kw = fetch_abstract_and_keywords_for_paper(p)
-                    return i, ab, kw
-                
+                    i,p = ip
+                    ab, kw, au = fetch_abstract_keywords_authors_for_paper(p)
+                    return i, ab, kw, au
+
                 with concurrent.futures.ThreadPoolExecutor(max_workers=workers3) as ex:
-                    futs = {ex.submit(fetch3_one, (i, p)): i for i, p in enumerate(need3)}
-                
+                    futs = {ex.submit(fetch3_one,(i,p)):i for i,p in enumerate(need3)}
                     for fut in concurrent.futures.as_completed(futs):
-                        try:
-                            idx, ab, kw = fut.result()
-                        except Exception:
-                            idx = futs[fut]
-                            ab, kw = "", ""
-                
-                        if ab:
-                            need3[idx]["abstract"] = ab
-                            found3 += 1
-                
-                        if kw and not need3[idx].get("keywords", ""):
-                            need3[idx]["keywords"] = kw
-                
-                        done3 += 1
-                        pct = int(done3 / total3 * 100)
-                        prog3.progress(pct / 100)
-                
-                        elapsed = time.time() - t0
-                        rate = done3 / elapsed if elapsed > 0 else 1
-                        m, sec = divmod(int((total3 - done3) / rate), 60)
-                
+                        idx,ab,kw,au = fut.result()
+                        if ab: need3[idx]["abstract"]=ab; found3+=1
+                        if kw and not need3[idx].get("keywords",""): need3[idx]["keywords"]=kw
+                        if au and _author_count(au) > _author_count(need3[idx].get("authors","")): need3[idx]["authors"]=au
+                        done3+=1
+                        pct=int(done3/total3*100); prog3.progress(pct/100)
+                        elapsed=time.time()-t0; rate=done3/elapsed if elapsed>0 else 1
+                        m,sec=divmod(int((total3-done3)/rate),60)
                         d3.markdown(f"**{pct}%** · ⏱ {m}m {sec}s · ✅ {found3}/{done3}")
 
                 prog3.progress(1.0)
@@ -1595,7 +1513,6 @@ with tab3:
                 ("Source / Journal",26),("DOI",28),("URL",28),
                 ("Keywords",35),("Abstract",60),
                 ("Screening Status",14),("Exclusion Reason",20),("Notes",30),
-                ("Relevanz",12),("Themenbereich",25),("Art der Quelle",22),   # NEW
             ]
 
             def write3(ws, plist, rfn=None, start=1):
@@ -1611,8 +1528,7 @@ with tab3:
                     vals=[p.get("database",""),p.get("title",""),p.get("authors",""),
                           p.get("year",""),p.get("source","")[:60],p.get("doi",""),
                           p.get("url","")[:100],p.get("keywords",""),p.get("abstract",""),
-                          p.get("screening_status","Pending"),p.get("exclusion_reason",""),p.get("notes",""),
-                          p.get("relevanz",""),p.get("themenbereich",""),p.get("art_der_quelle","")]   # NEW
+                          p.get("screening_status","Pending"),p.get("exclusion_reason",""),p.get("notes","")]
                     for ci,val in enumerate(vals,1):
                         c=ws.cell(row=ri,column=ci,value=val)
                         c.fill=fill; c.border=BDR; c.font=Font(name="Arial",size=9)
@@ -1623,10 +1539,6 @@ with tab3:
                     ws.add_data_validation(dv1); dv1.add(f'J{start+1}:J{start+len(plist)}')
                     dv2=DataValidation(type="list",formula1='"E1,E2,E3,E4,E5,E6,E7,E8,E9,"',allow_blank=True)
                     ws.add_data_validation(dv2); dv2.add(f'K{start+1}:K{start+len(plist)}')
-                    dv3=DataValidation(type="list",formula1='"Hoch,Mittel,Niedrig"',allow_blank=True)
-                    ws.add_data_validation(dv3); dv3.add(f'M{start+1}:M{start+len(plist)}')
-                    dv4=DataValidation(type="list",formula1='"Research Article,Journal,Conference Paper,Peer Reviewed Paper,Short Paper,Other"',allow_blank=True)
-                    ws.add_data_validation(dv4); dv4.add(f'O{start+1}:O{start+len(plist)}')
 
             # Sheet 1: PRISMA
             ws_p = wb3.active; ws_p.title = "PRISMA_Flow"
