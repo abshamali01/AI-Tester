@@ -3,7 +3,6 @@ Systematic Review Bot v9
 3 Dimensions: D1 Standardization & AI, D2 Context Engineering, D3 Token Efficiency
 PRISMA 2020 + Auto E1/E2/E7 + Year Recovery + Post-fetch Language Check + Word Template
 New: Full authors (no truncation) + Keywords column extracted from all databases
-Patch: Scopus BibTeX support (Scopus export now .bib instead of .csv)
 """
 
 import streamlit as st
@@ -46,7 +45,6 @@ def _paper(title="", authors="", year="", source="", doi="", url="", ptype="",
         "dimension": QUERY_MAP.get(query_id, ""),
         "keywords": keywords,
         "screening_status": "Pending", "exclusion_reason": "", "notes": "",
-        "relevanz": "", "themenbereich": "", "art_der_quelle": "",   # NEW
         "auto_excluded": False,
     }
 
@@ -129,41 +127,17 @@ def parse_bib(content, qid):
             m = re.search(pat, text, re.IGNORECASE|re.DOTALL)
             if m: r = m.group(1) if m.group(1) else m.group(2); return r.strip().replace('\n',' ')
             return ""
-        papers.append(_paper(
+        p = _paper(
             title=gf("title",entry), authors=gf("author",entry), year=gf("year",entry),
             source=gf("booktitle",entry) or gf("journal",entry), doi=gf("doi",entry),
             url=gf("url",entry),
             ptype="Conference Paper" if "inproceedings" in entry[:30].lower() else "Article",
             database="ACM", query_id=qid,
-            keywords=gf("keywords",entry) or gf("keyword",entry)))
-    return [p for p in papers if p["title"]]
-
-def parse_scopus_bib(content, qid):
-    """Scopus now exports BibTeX instead of CSV — parse it directly,
-    including abstract + keywords which Scopus BibTeX already includes."""
-    papers = []
-    for entry in re.split(r'\n@', content):
-        if not entry.strip(): continue
-        if not entry.startswith('@'): entry = '@' + entry
-        def gf(field, text):
-            pat = rf'{re.escape(field)}\s*=\s*\{{(.+?)\}}\s*[,\}}]|{re.escape(field)}\s*=\s*"(.+?)"\s*[,\}}]'
-            m = re.search(pat, text, re.IGNORECASE|re.DOTALL)
-            if m: r = m.group(1) if m.group(1) else m.group(2); return r.strip().replace('\n',' ')
-            return ""
-        tag = entry[:30].lower()
-        if "conference" in tag: ptype = "Conference Paper"
-        elif "book" in tag:     ptype = "Book chapter"
-        else:                   ptype = "Article"
-        kw = "; ".join(filter(None,[gf("author_keywords",entry), gf("keywords",entry)]))
-        p = _paper(
-            title=gf("title",entry), authors=gf("author",entry), year=gf("year",entry),
-            source=gf("journal",entry) or gf("booktitle",entry), doi=gf("doi",entry),
-            url=gf("url",entry),
-            ptype=ptype, database="Elsevier/Scopus", query_id=qid, keywords=kw)
+            keywords=gf("keywords",entry) or gf("keyword",entry))
         ab = gf("abstract", entry)
         if ab:
-            ab = re.sub(r'\s+', ' ', ab).strip()
-            p["abstract"] = ab
+            p["abstract"] = _clean(re.sub(r'\s+', ' ', ab).strip())
+            p["abstract_source"] = "ACM BibTeX export"
         papers.append(p)
     return [p for p in papers if p["title"]]
 
@@ -177,13 +151,6 @@ def detect_csv_type(content, fname=""):
     if "source title" in first: return "scopus"
     if "scopus.com" in second: return "scopus_pop"
     return "scholar"
-
-def is_scopus_bib(content, fname=""):
-    """Detect whether a .bib file is a Scopus export rather than an ACM export."""
-    if "scopus" in fname.lower():
-        return True
-    head = content[:2000].lower()
-    return "source = {scopus}" in head or "scopus.com" in head
 
 # ── Deduplication ─────────────────────────────────────────────────────────────
 def paper_score(p):
@@ -201,11 +168,10 @@ def deduplicate(papers):
     for p in sorted_p:
         doi   = p.get("doi","").strip().lower()
         title = p.get("title","").strip().lower()[:120]
-        if doi:
-            if doi in seen_doi: dupes.append(p); continue
-            seen_doi.add(doi)
-        else:
-            if title and title in seen_title: dupes.append(p); continue
+        # Duplicate if: same DOI OR same title (regardless of whether DOI present)
+        is_dup = (doi and doi in seen_doi) or (title and title in seen_title)
+        if is_dup: dupes.append(p); continue
+        if doi:   seen_doi.add(doi)
         if title: seen_title.add(title)
         unique.append(p)
     return unique, dupes
@@ -233,8 +199,8 @@ def is_english_text(text):
     if cnt(SPANISH_WORDS) >= 3: return False, "Spanish detected"
     return True, ""
 
-def is_valid_year(y):
-    return str(y).strip().isdigit() and 2015 <= int(str(y).strip()) <= 2026
+def is_valid_year(y, year_from=2015, year_to=2026):
+    return str(y).strip().isdigit() and year_from <= int(str(y).strip()) <= year_to
 
 # ── HTTP + Rate Limiter ───────────────────────────────────────────────────────
 import requests as _req
@@ -460,69 +426,239 @@ def scrape_html_abstract(html):
     except: pass
     return ""
 
-def fetch_abstract_and_keywords_for_paper(paper):
-    """Returns (abstract, keywords). Fills both where possible."""
+def _extract_abstract_from_pdf_bytes(pdf_bytes):
+    """Extract abstract from PDF bytes using PyMuPDF."""
+    try:
+        import fitz
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        full_text = ""
+        for i in range(min(len(doc), 4)):
+            full_text += doc[i].get_text("text") + "\n"
+        full_text = re.sub(r"[ \t]+", " ", full_text)
+        full_text = re.sub(r"\n{3,}", "\n\n", full_text).strip()
+        # Extract abstract section
+        patterns = [
+            r"\bAbstract\b\s*[:\-]?\s*(.*?)(?=\n\s*(?:Keywords?|Key\s+words|Index\s+Terms|1\.?\s+Introduction|INTRODUCTION)\b)",
+            r"\bABSTRACT\b\s*[:\-]?\s*(.*?)(?=\n\s*(?:KEYWORDS?|KEY\s+WORDS|INDEX\s+TERMS|1\.?\s+INTRODUCTION)\b)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, full_text, re.IGNORECASE|re.DOTALL)
+            if m:
+                ab = _clean(m.group(1))
+                if 80 < len(ab) < 6000 and _is_english_abstract(ab):
+                    return ab
+        # Fallback: look for academic paragraph on first page
+        best = ""
+        academic = ['study','research','method','results','analysis','model','system','proposed','approach','paper','present']
+        for para in full_text.split('\n\n'):
+            para = para.strip()
+            if 100 < len(para) < 2000 and any(w in para.lower() for w in academic):
+                if len(para) > len(best):
+                    best = para
+        return _clean(best) if len(best) > 80 else ""
+    except Exception:
+        return ""
+
+
+def fetch_unpaywall_abstract(doi, email="sr-bot@uni-koblenz.de"):
+    """
+    Query Unpaywall for open-access PDF URL, then extract abstract via PyMuPDF.
+    Free API — no key needed, just an email.
+    Returns abstract string or empty.
+    """
+    if not doi:
+        return ""
+    try:
+        _rate_limit()
+        r = _req.get(
+            f"https://api.unpaywall.org/v2/{doi}",
+            params={"email": email},
+            timeout=8
+        )
+        if not r.ok:
+            return ""
+        data = r.json()
+        loc = data.get("best_oa_location") or {}
+        pdf_url = loc.get("url_for_pdf") or ""
+        html_url = loc.get("url") or ""
+
+        # Try PDF first
+        if pdf_url:
+            _rate_limit()
+            resp = _req.get(pdf_url, headers={"User-Agent":"Mozilla/5.0"},
+                           timeout=15, allow_redirects=True, verify=False)
+            if resp.ok:
+                ct = resp.headers.get("Content-Type","").lower()
+                if "pdf" in ct or pdf_url.lower().endswith(".pdf"):
+                    ab = _extract_abstract_from_pdf_bytes(resp.content)
+                    if ab: return ab
+                else:
+                    ab = scrape_html_abstract(resp.text)
+                    if ab: return ab
+
+        # Try HTML OA page
+        if html_url and html_url != pdf_url:
+            _rate_limit()
+            resp = _req.get(html_url, headers={"User-Agent":"Mozilla/5.0"},
+                           timeout=12, allow_redirects=True, verify=False)
+            if resp.ok and "pdf" not in resp.headers.get("Content-Type","").lower():
+                ab = scrape_html_abstract(resp.text)
+                if ab: return ab
+
+    except Exception:
+        pass
+    return ""
+
+
+def fetch_abstract_and_keywords_for_paper(paper, unpaywall_email="sr-bot@uni-koblenz.de"):
+    """Returns (abstract, keywords, abstract_source). Fills all where possible."""
     doi   = _norm_doi(paper.get("doi",""))
     url   = paper.get("url","").strip()
     title = paper.get("title","")
     existing_kw = paper.get("keywords","").strip()
 
     abstract = ""
+    abstract_source = ""
     keywords = existing_kw  # start with what we already have from CSV/BIB
 
     if doi:
-        # CrossRef — abstract only
         ab, _ = fetch_crossref_abstract(doi, title)
-        if ab: abstract = ab
+        if ab: abstract = ab; abstract_source = "CrossRef"
 
-        # Semantic Scholar — abstract + fields of study as keywords
         if not abstract or not keywords:
             ab2, kw2 = fetch_semantic_scholar_data(doi)
-            if not abstract and ab2: abstract = ab2
+            if not abstract and ab2: abstract = ab2; abstract_source = "Semantic Scholar"
             if not keywords and kw2: keywords = kw2
 
-        # OpenAlex — abstract + concepts as keywords
         if not abstract or not keywords:
             ab3, kw3 = fetch_openalex_data(doi)
-            if not abstract and ab3: abstract = ab3
+            if not abstract and ab3: abstract = ab3; abstract_source = "OpenAlex"
             if not keywords and kw3: keywords = kw3
 
-        # EuropePMC — abstract only
         if not abstract:
-            abstract = fetch_europepmc_abstract(doi)
+            ab4 = fetch_europepmc_abstract(doi)
+            if ab4: abstract = ab4; abstract_source = "EuropePMC"
 
-        # doi.org URL scrape
         if not abstract:
-            doi_url = f"https://doi.org/{doi}"
-            r = _fetch_url(doi_url)
+            r = _fetch_url(f"https://doi.org/{doi}")
             if r and 'pdf' not in r.headers.get('Content-Type','').lower():
-                abstract = scrape_html_abstract(r.text)
+                ab5 = scrape_html_abstract(r.text)
+                if ab5: abstract = ab5; abstract_source = "Publisher page (DOI)"
 
-    # Original URL scrape
     if not abstract and url and not _is_pdf(url) and not _is_blocked(url) and not _is_scopus_inward(url):
         if not doi or url != f"https://doi.org/{doi}":
             r = _fetch_url(url)
             if r and 'pdf' not in r.headers.get('Content-Type','').lower():
-                abstract = scrape_html_abstract(r.text)
+                ab6 = scrape_html_abstract(r.text)
+                if ab6: abstract = ab6; abstract_source = "Publisher page (URL)"
 
-    return abstract, keywords
+    # Step 7: Unpaywall → open-access PDF → PyMuPDF extract
+    if not abstract and doi:
+        ab7 = fetch_unpaywall_abstract(doi, email=unpaywall_email)
+        if ab7: abstract = ab7; abstract_source = "Unpaywall OA PDF"
+
+    if not abstract:
+        abstract_source = "Not available — manual check"
+
+    return abstract, keywords, abstract_source
+
+# ── Author Enrichment ─────────────────────────────────────────────────────────
+def _author_count(authors):
+    """Count authors in a string — used to prefer more complete author lists."""
+    if not authors: return 0
+    if "et al" in authors.lower(): return 1
+    parts = re.split(r',\s*(?=[A-Z])|;\s*|\s+and\s+', authors)
+    return len([p for p in parts if p.strip()])
+
+def _format_crossref_authors(author_list):
+    names = []
+    for a in author_list or []:
+        given  = a.get("given","").strip()
+        family = a.get("family","").strip()
+        name   = " ".join(x for x in [given, family] if x)
+        if name: names.append(name)
+    return ", ".join(names)
+
+def _format_semantic_authors(author_list):
+    return ", ".join(a.get("name","").strip() for a in (author_list or []) if a.get("name","").strip())
+
+def _format_openalex_authors(authorships):
+    return ", ".join(
+        item.get("author",{}).get("display_name","").strip()
+        for item in (authorships or [])
+        if item.get("author",{}).get("display_name","").strip()
+    )
+
+def enrich_authors_for_paper(paper):
+    """
+    Try to get full author list from CrossRef → OpenAlex → Semantic Scholar.
+    Returns best author string found (most authors wins).
+    """
+    doi = _norm_doi(paper.get("doi",""))
+    existing = paper.get("authors","").strip()
+    best = existing
+    best_count = _author_count(existing)
+
+    if not doi:
+        return best
+
+    # CrossRef
+    try:
+        _rate_limit()
+        r = _req.get(f"https://api.crossref.org/works/{doi}",
+                     headers={"User-Agent":"SystematicReview/1.0"}, timeout=8)
+        if r.ok:
+            msg = r.json().get("message",{})
+            au = _format_crossref_authors(msg.get("author",[]))
+            if _author_count(au) > best_count:
+                best = au; best_count = _author_count(au)
+    except: pass
+
+    if best_count > 2:  # good enough after CrossRef
+        return best
+
+    # OpenAlex
+    try:
+        _rate_limit()
+        r = _req.get(f"https://api.openalex.org/works/doi:{doi}", timeout=8)
+        if r.ok:
+            au = _format_openalex_authors(r.json().get("authorships",[]))
+            if _author_count(au) > best_count:
+                best = au; best_count = _author_count(au)
+    except: pass
+
+    if best_count > 2:
+        return best
+
+    # Semantic Scholar
+    try:
+        _rate_limit()
+        r = _req.get(f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}",
+                     params={"fields":"authors"}, timeout=8)
+        if r.ok:
+            au = _format_semantic_authors(r.json().get("authors",[]))
+            if _author_count(au) > best_count:
+                best = au
+    except: pass
+
+    return best
 
 # ── Auto-Screening ────────────────────────────────────────────────────────────
-def auto_screen(papers):
+def auto_screen(papers, year_from=2015, year_to=2026):
     counts = {"E1": 0, "E2": 0, "E7": 0, "E1_recovered": 0}
     for p in papers:
         year = str(p.get("year","")).strip()
         doi  = _norm_doi(p.get("doi",""))
 
-        if year and year.isdigit() and not is_valid_year(year):
+        if year and year.isdigit() and not is_valid_year(year, year_from, year_to):
             p.update(screening_status="Exclude", exclusion_reason="E1",
-                     notes=f"Auto: year {year} outside 2015-2026", auto_excluded=True)
+                     notes=f"Auto: year {year} outside {year_from}-{year_to}", auto_excluded=True)
             counts["E1"] += 1; continue
 
         if not year or not year.isdigit():
             if doi:
                 recovered = recover_year(p)
-                if recovered and recovered.isdigit() and is_valid_year(recovered):
+                if recovered and recovered.isdigit() and is_valid_year(recovered, year_from, year_to):
                     p["year"] = recovered
                     p["notes"] = f"Year recovered from API: {recovered}"
                     counts["E1_recovered"] += 1
@@ -540,9 +676,9 @@ def auto_screen(papers):
                      notes=f"Auto: not English — {reason}", auto_excluded=True)
             counts["E2"] += 1; continue
 
-        if not p.get("title","").strip() or not p.get("authors","").strip():
+        if not p.get("title","").strip():
             p.update(screening_status="Exclude", exclusion_reason="E7",
-                     notes="Auto: missing title or authors", auto_excluded=True)
+                     notes="Auto: missing title", auto_excluded=True)
             counts["E7"] += 1
 
     return papers, counts
@@ -562,7 +698,7 @@ def post_fetch_language_check(papers):
     return papers, flagged
 
 # ── Excel Builder ─────────────────────────────────────────────────────────────
-def build_dimension_excel(papers, dupe_list, dim_code, dim_name):
+def build_dimension_excel(papers, dupe_list, dim_code, dim_name, year_from=2015, year_to=2026):
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
@@ -587,7 +723,6 @@ def build_dimension_excel(papers, dupe_list, dim_code, dim_name):
     wb = openpyxl.Workbook()
 
     # ── Column definitions — now includes Authors (full) + Keywords ──
-    # ── Column definitions — now includes Authors (full) + Keywords + Relevanz/Themenbereich/Art der Quelle ──
     COLS = [
         ("Database",       14),
         ("Title",          50),
@@ -596,14 +731,11 @@ def build_dimension_excel(papers, dupe_list, dim_code, dim_name):
         ("Source / Journal",26),
         ("DOI",            28),
         ("URL",            28),
-        ("Keywords",       35),
+        ("Keywords",       35),   # NEW
         ("Abstract",       60),
         ("Screening Status",14),
         ("Exclusion Reason",20),
         ("Notes",          30),
-        ("Relevanz",       12),   # NEW: Hoch / Mittel / Niedrig
-        ("Themenbereich",  25),   # NEW: free text
-        ("Art der Quelle", 22),   # NEW: dropdown
     ]
 
     def write_screen(ws, plist, rfn=None, start=1):
@@ -629,9 +761,6 @@ def build_dimension_excel(papers, dupe_list, dim_code, dim_name):
                 p.get("screening_status","Pending"),
                 p.get("exclusion_reason",""),
                 p.get("notes",""),
-                p.get("relevanz",""),           # NEW
-                p.get("themenbereich",""),      # NEW
-                p.get("art_der_quelle",""),     # NEW
             ]
             for ci,val in enumerate(vals,1):
                 c=ws.cell(row=ri,column=ci,value=val)
@@ -643,12 +772,6 @@ def build_dimension_excel(papers, dupe_list, dim_code, dim_name):
             ws.add_data_validation(dv1); dv1.add(f'J{start+1}:J{start+len(plist)}')
             dv2=DataValidation(type="list",formula1='"E1,E2,E3,E4,E5,E6,E7,E8,E9,"',allow_blank=True)
             ws.add_data_validation(dv2); dv2.add(f'K{start+1}:K{start+len(plist)}')
-            # NEW: Relevanz dropdown -> column M (13th)
-            dv3=DataValidation(type="list",formula1='"Hoch,Mittel,Niedrig"',allow_blank=True)
-            ws.add_data_validation(dv3); dv3.add(f'M{start+1}:M{start+len(plist)}')
-            # NEW: Art der Quelle dropdown -> column O (15th)
-            dv4=DataValidation(type="list",formula1='"Research Article,Journal,Conference Paper,Peer Reviewed Paper,Short Paper,Other"',allow_blank=True)
-            ws.add_data_validation(dv4); dv4.add(f'O{start+1}:O{start+len(plist)}')
 
     # Sheet 1: PRISMA
     ws=wb.active; ws.title="PRISMA_Flow"; ws.sheet_view.showGridLines=False
@@ -667,7 +790,7 @@ def build_dimension_excel(papers, dupe_list, dim_code, dim_name):
         ["Identification",f"Records identified: {dim_name}","All","ALL",len(dim_papers)+len(dim_dupes),"",""],
         ["Identification","Duplicate records removed","All","ALL",len(dim_dupes),"",""],
         ["Identification","Records after deduplication","All","ALL",len(dim_papers),"",""],
-        ["Screening","Auto-excluded: E1 (invalid year)","All","ALL",auto_e1,"","Auto-detected"],
+        ["Screening",f"Auto-excluded: E1 (year outside {year_from}-{year_to})","All","ALL",auto_e1,"","Auto-detected"],
         ["Screening","Auto-excluded: E2 (not English)","All","ALL",auto_e2,"","Auto-detected (pre + post-fetch)"],
         ["Screening","Auto-excluded: E7 (insufficient detail)","All","ALL",auto_e7,"","Auto-detected"],
         ["Screening","Pending manual screening","All","ALL",len(pending),"","See Screening_Sheet"],
@@ -759,7 +882,7 @@ def build_dimension_excel(papers, dupe_list, dim_code, dim_name):
     return buf.read()
 
 # ── Word Template ─────────────────────────────────────────────────────────────
-def generate_word():
+def generate_word(year_from=2015, year_to=2026):
     from docx import Document
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     doc = Document()
@@ -780,7 +903,7 @@ def generate_word():
     doc.add_heading('2.1 Search Strategy', 2)
     doc.add_paragraph('Database searches were conducted in:')
     for db in ['Springer Link','Scopus / Elsevier','ACM Digital Library','Google Scholar (via Publish or Perish)']: add_bullet(db)
-    doc.add_paragraph('Year range: 2015–2026 | Language: English | Types: Journal + Conference + Review')
+    doc.add_paragraph(f'Year range: {year_from}–{year_to} | Language: English | Types: Journal + Conference + Review')
 
     for dim, queries in [
         ('Dimension 1: Standardization & AI', [
@@ -888,12 +1011,18 @@ with tab1:
 
     col_h1, col_rst1 = st.columns([4,1])
     with col_h1:
-        st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📁 Step 1 — Upload Files</h3><p style="color:#8b949e;margin-bottom:12px;">Name files like <code>springer_d1q1.csv</code>, <code>acm_d1q2.bib</code>, <code>scopus_d2q1.bib</code> (or .csv), <code>scholar_d3q1.csv</code></p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📁 Step 1 — Upload Files</h3><p style="color:#8b949e;margin-bottom:12px;">Name files like <code>springer_d1q1.csv</code>, <code>acm_d1q2.bib</code>, <code>scopus_d2q1.csv</code>, <code>scholar_d3q1.csv</code></p></div>', unsafe_allow_html=True)
     with col_rst1:
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
         if st.button("🔄 Reset / New Run", key="reset_tab1", use_container_width=True):
             st.session_state.clear(); st.rerun()
-    st.caption("Supports: Springer CSV · Scopus CSV or BibTeX · Google Scholar CSV (Publish or Perish) · ACM BibTeX")
+    st.caption("Supports: Springer CSV · Scopus CSV · Google Scholar CSV (Publish or Perish) · ACM BibTeX")
+
+    cy1, cy2, cy3, cy4 = st.columns([1,1,2,1])
+    with cy1: year_from = st.number_input("Year from", min_value=1990, max_value=2030, value=2015, step=1, key="year_from")
+    with cy2: year_to   = st.number_input("Year to",   min_value=1990, max_value=2030, value=2026, step=1, key="year_to")
+    with cy3: unpaywall_email = st.text_input("Unpaywall email (for OA PDF fallback)", value="sr-bot@uni-koblenz.de", key="unp_email")
+    with cy4: enrich_authors  = st.checkbox("Enrich authors from APIs", value=True, key="enrich_auth")
 
     uploaded = st.file_uploader("Drop all files here", type=["csv","bib"],
                                   accept_multiple_files=True, label_visibility="collapsed")
@@ -909,10 +1038,7 @@ with tab1:
                 if q in fname: qid=q.upper(); break
             cf = f.read().decode("utf-8",errors="replace")
             if fname.endswith(".bib"):
-                if is_scopus_bib(cf, fname):
-                    papers=parse_scopus_bib(cf,qid); db="Elsevier/Scopus"
-                else:
-                    papers=parse_bib(cf,qid); db="ACM"
+                papers=parse_bib(cf,qid); db="ACM"
             else:
                 ctype=detect_csv_type(cf,fname)
                 if ctype=="springer":         papers=parse_springer_csv(cf,qid);   db="Springer"
@@ -926,7 +1052,7 @@ with tab1:
             all_papers.extend(papers)
 
         unique, dupe_list = deduplicate(all_papers)
-        unique, auto_counts = auto_screen(unique)
+        unique, auto_counts = auto_screen(unique, year_from, year_to)
         pending = [p for p in unique if p.get("screening_status")=="Pending"]
         stats.update({
             "total_raw":len(all_papers), "duplicates":len(dupe_list),
@@ -949,6 +1075,14 @@ with tab1:
             for p in unique: d=p.get("dimension","")[:2]; d_counts[d]=d_counts.get(d,0)+1
             summary=" / ".join(f"{k}:{v}" for k,v in sorted(d_counts.items()))
             st.markdown(f'<div class="stat-box"><div class="stat-num" style="font-size:1.1rem">{summary}</div><div class="stat-lbl">By Dimension</div></div>',unsafe_allow_html=True)
+        # Per-database breakdown
+        db_counts = {}
+        for p in unique: db_counts[p.get("database","?")] = db_counts.get(p.get("database","?"),0)+1
+        db_html = " &nbsp;|&nbsp; ".join(f"<b>{db}</b>: {n}" for db,n in sorted(db_counts.items()))
+        st.markdown(f'<div class="warn-box" style="color:#8b949e;">📊 Per database (after dedup): {db_html}</div>',unsafe_allow_html=True)
+        # Auto-screen summary
+        ae1=auto_counts["E1"]; ae2=auto_counts["E2"]; ae7=auto_counts["E7"]; rec=auto_counts["E1_recovered"]
+        st.markdown(f'<div class="warn-box">🤖 Auto-screening: <b>{ae1}</b> E1 (year {year_from}–{year_to}) · <b>{ae2}</b> E2 (language) · <b>{ae7}</b> E7 (no title) · <b>{rec}</b> years recovered via API</div>',unsafe_allow_html=True)
 
         st.markdown("---")
         need_abstract=[p for p in pending if p.get("doi","").strip() or p.get("url","").strip()]
@@ -979,14 +1113,14 @@ with tab1:
 
                 def fetch_one(ip):
                     i,p=ip
-                    abstract, keywords = fetch_abstract_and_keywords_for_paper(p)
-                    return i, abstract, keywords
+                    abstract, keywords, ab_src = fetch_abstract_and_keywords_for_paper(p, unpaywall_email)
+                    return i, abstract, keywords, ab_src
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
                     futures={ex.submit(fetch_one,(i,p)):i for i,p in enumerate(need_abstract)}
                     for future in concurrent.futures.as_completed(futures):
-                        idx,abstract,keywords=future.result()
-                        results[idx]=(abstract,keywords)
+                        idx,abstract,keywords,ab_src=future.result()
+                        results[idx]=(abstract,keywords,ab_src)
                         if abstract: found+=1
                         completed+=1
                         pct=int((completed/total)*100)
@@ -996,8 +1130,14 @@ with tab1:
                         m,s=divmod(int((total-completed)/rate),60)
                         d_txt.markdown(f"**{pct}%** · ⏱ {m}m {s}s remaining · ✅ {found} fetched · {completed}/{total}")
 
-                for idx,(abstract,keywords) in results.items():
-                    if abstract: need_abstract[idx]["abstract"]=abstract
+                for idx,(abstract,keywords,ab_src) in results.items():
+                    if abstract:
+                        need_abstract[idx]["abstract"]=abstract
+                        need_abstract[idx]["abstract_source"]=ab_src
+                        need_abstract[idx]["metadata_status"]="Recovered"
+                    else:
+                        need_abstract[idx]["abstract_source"]=ab_src
+                        need_abstract[idx]["metadata_status"]="Not available — manual check"
                     if keywords and not need_abstract[idx].get("keywords",""):
                         need_abstract[idx]["keywords"]=keywords
 
@@ -1011,16 +1151,41 @@ with tab1:
                     st.markdown(f'<div class="warn-box">⚠️ <b>{pf_flagged} papers</b> flagged E2 post-fetch</div>',unsafe_allow_html=True)
                 s_txt.empty()
 
+            # Author enrichment (concurrent, only for papers with DOI and truncated authors)
+            if enrich_authors:
+                need_authors = [p for p in unique
+                                if p.get("doi","").strip()
+                                and ("et al" in p.get("authors","").lower() or _author_count(p.get("authors","")) <= 2)]
+                if need_authors:
+                    s_txt.markdown(f"👥 **Enriching authors for {len(need_authors)} papers...**")
+                    au_prog = st.progress(0); au_done = 0
+
+                    def enrich_one(p):
+                        return p, enrich_authors_for_paper(p)
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+                        au_futs = {ex.submit(enrich_one, p): p for p in need_authors}
+                        for fut in concurrent.futures.as_completed(au_futs):
+                            p, full_au = fut.result()
+                            if full_au and _author_count(full_au) > _author_count(p.get("authors","")):
+                                p["authors"] = full_au
+                            au_done += 1
+                            au_prog.progress(au_done / len(need_authors))
+
+                    au_prog.empty()
+                    s_txt.markdown(f"✅ Authors enriched for {len(need_authors)} papers")
+                    s_txt.empty()
+
             s_txt.markdown("📊 **Building dimension workbooks...**")
             for dim_code,dim_name in DIMENSION_NAMES.items():
-                excel_bytes=build_dimension_excel(unique,dupe_list,dim_code,dim_name)
+                excel_bytes=build_dimension_excel(unique,dupe_list,dim_code,dim_name,year_from,year_to)
                 if excel_bytes:
                     st.session_state[f"excel_{dim_code}"]=excel_bytes
                     st.session_state[f"fname_{dim_code}"]=f"{dim_name}_{datetime.now():%Y%m%d_%H%M}.xlsx"
 
             s_txt.markdown("📝 **Generating Word template...**")
             try:
-                st.session_state["word_bytes"]=generate_word()
+                st.session_state["word_bytes"]=generate_word(year_from, year_to)
                 st.session_state["word_fname"]=f"SR_Method_Findings_{datetime.now():%Y%m%d_%H%M}.docx"
             except Exception as e:
                 st.warning(f"Word failed: {e}")
@@ -1030,6 +1195,11 @@ with tab1:
             st.session_state["dupes"]=len(dupe_list)
             st.session_state["abstracts"]=sum(1 for p in unique if p.get("abstract","").strip())
             st.session_state["auto_total"]=stats.get("auto_total",0)
+            src_counts={}
+            for p in unique:
+                src=p.get("abstract_source","")
+                if src and src!="Not available — manual check": src_counts[src]=src_counts.get(src,0)+1
+            st.session_state["src_counts"]=src_counts
             s_txt.empty(); prog.empty()
 
         if st.session_state.get("excel_ready"):
@@ -1055,18 +1225,21 @@ with tab1:
                     key="dl_word")
             n=st.session_state.get("total",0); a=st.session_state.get("abstracts",0)
             d=st.session_state.get("dupes",0); at=st.session_state.get("auto_total",0)
-            st.success(f"✅ {n} papers · {a} with abstract · {d} dupes removed · {at} auto-excluded (E1/E2/E7)")
+            src_counts=st.session_state.get("src_counts",{})
+            src_summary=" · ".join(f"{k}: {v}" for k,v in sorted(src_counts.items()) if v>0)
+            st.success(f"✅ {n} papers · {a} with abstract · {d} dupes removed · {at} auto-excluded")
+            if src_summary: st.info(f"📡 Abstract sources — {src_summary}")
 
     else:
         st.markdown("---")
         st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📋 File Naming Convention</h3></div>',unsafe_allow_html=True)
         st.dataframe(pd.DataFrame({
-            "File":  ["springer_d1q1.csv","springer_d1q2.csv","acm_d1q1.bib","acm_d1q2.bib","scopus_d2q1.bib","scholar_d3q1.csv"],
+            "File":  ["springer_d1q1.csv","springer_d1q2.csv","acm_d1q1.bib","acm_d1q2.bib","scopus_d2q1.csv","scholar_d3q1.csv"],
             "DB":    ["Springer","Springer","ACM","ACM","Elsevier/Scopus","Google Scholar"],
             "Query": ["D1Q1","D1Q2","D1Q1","D1Q2","D2Q1","D3Q1"],
-            "Format":["CSV","CSV","BibTeX","BibTeX","BibTeX (or CSV)","CSV"],
+            "Format":["CSV","CSV","BibTeX","BibTeX","CSV","CSV"],
         }),use_container_width=True,hide_index=True)
-        st.info("💡 Query ID (d1q1, d2q2 etc.) must be in filename. Scopus exports as BibTeX are auto-detected.")
+        st.info("💡 Query ID (d1q1, d2q2 etc.) must be in filename.")
 
 with tab2:
     st.markdown("""
@@ -1136,17 +1309,32 @@ with tab2:
         return expanded
 
     def screen_paper(title, abstract, keywords):
+        """
+        Keyword screener — outputs relevance flag, not auto-exclusion.
+        Having no keyword match is NOT grounds for E4 exclusion;
+        it flags the paper for manual review (Pending).
+        Only if both title + abstract are present AND zero hits → mark Pending (low relevance).
+        Researcher makes final Include/Exclude decision based on eligibility criteria.
+        """
         has_title    = bool(title.strip())
         has_abstract = bool(abstract.strip())
         title_hits    = [kw for kw in keywords if kw in title.lower()]    if has_title    else []
         abstract_hits = [kw for kw in keywords if kw in abstract.lower()] if has_abstract else []
         all_hits = list(set(title_hits + abstract_hits))
+
         if has_title and has_abstract:
-            if all_hits: return "Include", "", f"Match in title+abstract: {', '.join(all_hits[:5])}"
-            else:        return "Exclude", "E4", "No keyword match in title or abstract"
+            if all_hits:
+                n = len(all_hits)
+                relevance = "High" if n >= 3 else ("Medium" if n >= 1 else "Low")
+                return "Include", "", f"[{relevance} relevance] Match: {', '.join(all_hits[:5])}"
+            else:
+                # No hits — flag for manual review, do NOT auto-exclude
+                return "Pending", "", "No keyword match in title or abstract — manual eligibility check required"
         elif has_title and not has_abstract:
-            if title_hits: return "Include", "", f"Match in title: {', '.join(title_hits[:5])}"
-            else:          return "Pending", "", "No title keyword match — abstract missing, check manually"
+            if title_hits:
+                return "Include", "", f"Match in title: {', '.join(title_hits[:5])} (abstract missing)"
+            else:
+                return "Pending", "", "No title keyword match — abstract missing, check manually"
         else:
             return "Pending", "", "No title or abstract — check manually"
 
@@ -1291,7 +1479,7 @@ with tab3:
 
     col_gh, col_gr = st.columns([4,1])
     with col_gh:
-        st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📁 Upload Files</h3><p style="color:#8b949e;margin-bottom:8px;">Name files with database prefix: <code>springer_*.csv</code>, <code>scopus_*.csv</code> or <code>scopus_*.bib</code>, <code>scholar_*.csv</code>, <code>acm_*.bib</code><br>No query ID required.</p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="sr-card"><h3 style="margin-top:0;">📁 Upload Files</h3><p style="color:#8b949e;margin-bottom:8px;">Name files with database prefix: <code>springer_*.csv</code>, <code>scopus_*.csv</code>, <code>scholar_*.csv</code>, <code>acm_*.bib</code><br>No query ID required.</p></div>', unsafe_allow_html=True)
     with col_gr:
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
         if st.button("🔄 Reset", key="reset_tab3", use_container_width=True):
@@ -1299,7 +1487,11 @@ with tab3:
                 if k.startswith("g3_"): del st.session_state[k]
             st.rerun()
 
-    st.caption("Supports: Springer CSV · Scopus CSV or BibTeX · Google Scholar CSV · ACM BibTeX")
+    st.caption("Supports: Springer CSV · Scopus CSV · Google Scholar CSV · ACM BibTeX")
+
+    g3y1, g3y2 = st.columns(2)
+    with g3y1: g3_year_from = st.number_input("Year from", min_value=1990, max_value=2030, value=2015, step=1, key="g3_year_from")
+    with g3y2: g3_year_to   = st.number_input("Year to",   min_value=1990, max_value=2030, value=2026, step=1, key="g3_year_to")
 
     g3_uploaded = st.file_uploader("Drop files here", type=["csv","bib"],
                                     accept_multiple_files=True,
@@ -1308,15 +1500,14 @@ with tab3:
     if g3_uploaded:
         # ── Parse ────────────────────────────────────────────────────────────
         def g3_paper(title="", authors="", year="", source="", doi="", url="",
-             ptype="", database="", keywords=""):
-                return {
-                    "title": title, "authors": authors, "year": str(year),
-                    "source": source, "doi": doi, "abstract": "", "url": url,
-                    "type": ptype, "database": database, "keywords": keywords,
-                    "screening_status": "Pending", "exclusion_reason": "", "notes": "",
-                    "relevanz": "", "themenbereich": "", "art_der_quelle": "",   # NEW
-                    "auto_excluded": False,
-                }
+                     ptype="", database="", keywords=""):
+            return {
+                "title": title, "authors": authors, "year": str(year),
+                "source": source, "doi": doi, "abstract": "", "url": url,
+                "type": ptype, "database": database, "keywords": keywords,
+                "screening_status": "Pending", "exclusion_reason": "", "notes": "",
+                "auto_excluded": False,
+            }
 
         def g3_parse_springer(content):
             papers = []
@@ -1352,33 +1543,6 @@ with tab3:
                         keywords=kw or row.get("Keywords","").strip()))
             except: pass
             return papers
-
-        def g3_parse_scopus_bib(content):
-            """Scopus BibTeX export parser for the Generic Importer tab."""
-            papers = []
-            for entry in _re3.split(r'\n@', content):
-                if not entry.strip(): continue
-                if not entry.startswith('@'): entry = '@' + entry
-                def gf(field, text):
-                    pat = rf'{_re3.escape(field)}\s*=\s*\{{(.+?)\}}\s*[,\}}]|{_re3.escape(field)}\s*=\s*"(.+?)"\s*[,\}}]'
-                    m = _re3.search(pat, text, _re3.IGNORECASE|_re3.DOTALL)
-                    if m: r = m.group(1) if m.group(1) else m.group(2); return r.strip().replace('\n',' ')
-                    return ""
-                tag = entry[:30].lower()
-                if "conference" in tag: ptype = "Conference Paper"
-                elif "book" in tag:     ptype = "Book chapter"
-                else:                   ptype = "Article"
-                kw = "; ".join(filter(None,[gf("author_keywords",entry), gf("keywords",entry)]))
-                p = g3_paper(
-                    title=gf("title",entry), authors=gf("author",entry), year=gf("year",entry),
-                    source=gf("journal",entry) or gf("booktitle",entry), doi=gf("doi",entry),
-                    url=gf("url",entry), ptype=ptype, database="Scopus", keywords=kw)
-                ab = gf("abstract", entry)
-                if ab:
-                    ab = _re3.sub(r'\s+', ' ', ab).strip()
-                    p["abstract"] = ab
-                papers.append(p)
-            return [p for p in papers if p["title"]]
 
         def g3_parse_scholar(content):
             papers = []
@@ -1427,12 +1591,8 @@ with tab3:
             if "scopus.com" in second: return "scopus"
             return "scholar"
 
-        def g3_is_scopus_bib(content, fname=""):
-            if "scopus" in fname.lower(): return True
-            head = content[:2000].lower()
-            return "source = {scopus}" in head or "scopus.com" in head
-
         def g3_dedup(papers):
+            """Dedup on BOTH doi AND normalized title — catches cross-DB duplicates."""
             sorted_p = sorted(papers, key=lambda p: (
                 bool(p.get("abstract","").strip())*3 +
                 bool(p.get("doi","").strip())*2 +
@@ -1440,27 +1600,25 @@ with tab3:
             ), reverse=True)
             seen_doi, seen_title, unique, dupes = set(), set(), [], []
             for p in sorted_p:
-                doi = p.get("doi","").strip().lower()
-                title = p.get("title","").strip().lower()[:120]
-                if doi:
-                    if doi in seen_doi: dupes.append(p); continue
-                    seen_doi.add(doi)
-                else:
-                    if title and title in seen_title: dupes.append(p); continue
-                if title: seen_title.add(title)
+                _doi = p.get("doi","").strip().lower()
+                _ttl = re.sub(r"[^\w\s]","",p.get("title","").strip().lower())[:120].strip()
+                _dup = (_doi and _doi in seen_doi) or (_ttl and _ttl in seen_title)
+                if _dup: dupes.append(p); continue
+                if _doi: seen_doi.add(_doi)
+                if _ttl: seen_title.add(_ttl)
                 unique.append(p)
             return unique, dupes
 
-        def g3_is_valid_year(y):
-            return str(y).strip().isdigit() and 2015 <= int(str(y).strip()) <= 2026
+        def g3_is_valid_year(y, yf=2015, yt=2026):
+            return str(y).strip().isdigit() and yf <= int(str(y).strip()) <= yt
 
-        def g3_auto_screen(papers):
+        def g3_auto_screen(papers, yf=2015, yt=2026):
             counts = {"E1":0, "E2":0, "E7":0}
             for p in papers:
                 year = str(p.get("year","")).strip()
-                if year and year.isdigit() and not g3_is_valid_year(year):
+                if year and year.isdigit() and not g3_is_valid_year(year, yf, yt):
                     p.update(screening_status="Exclude", exclusion_reason="E1",
-                             notes=f"Auto: year {year} outside 2015-2026", auto_excluded=True)
+                             notes=f"Auto: year {year} outside {yf}-{yt}", auto_excluded=True)
                     counts["E1"] += 1; continue
                 if not year or not year.isdigit():
                     p["notes"] = "Year missing — check manually"; continue
@@ -1470,10 +1628,13 @@ with tab3:
                     p.update(screening_status="Exclude", exclusion_reason="E2",
                              notes=f"Auto: not English — {reason}", auto_excluded=True)
                     counts["E2"] += 1; continue
-                if not p.get("title","").strip() or not p.get("authors","").strip():
+                if not p.get("title","").strip():
                     p.update(screening_status="Exclude", exclusion_reason="E7",
-                             notes="Auto: missing title or authors", auto_excluded=True)
+                             notes="Auto: missing title", auto_excluded=True)
                     counts["E7"] += 1
+                elif not p.get("authors","").strip():
+                    _n = p.get("notes","")
+                    p["notes"] = (_n + " | " if _n else "") + "Authors missing — check manually"
             return papers, counts
 
         # Parse all files
@@ -1484,10 +1645,7 @@ with tab3:
             fname = f.name.lower()
             cf = f.read().decode("utf-8", errors="replace")
             if fname.endswith(".bib"):
-                if g3_is_scopus_bib(cf, fname):
-                    papers = g3_parse_scopus_bib(cf); db = "Scopus"
-                else:
-                    papers = g3_parse_bib(cf); db = "ACM"
+                papers = g3_parse_bib(cf); db = "ACM"
             else:
                 ctype = g3_detect(cf, fname)
                 if ctype == "springer":   papers = g3_parse_springer(cf); db = "Springer"
@@ -1497,7 +1655,7 @@ with tab3:
             all_papers3.extend(papers)
 
         unique3, dupes3 = g3_dedup(all_papers3)
-        unique3, counts3 = g3_auto_screen(unique3)
+        unique3, counts3 = g3_auto_screen(unique3, g3_year_from, g3_year_to)
         pending3 = [p for p in unique3 if p.get("screening_status")=="Pending"]
 
         # Show parse log
@@ -1513,6 +1671,12 @@ with tab3:
         with c2: st.markdown(f'<div class="stat-box"><div class="stat-num">{len(dupes3)}</div><div class="stat-lbl">Duplicates</div></div>', unsafe_allow_html=True)
         with c3: st.markdown(f'<div class="stat-box"><div class="stat-num">{len(unique3)}</div><div class="stat-lbl">Unique</div></div>', unsafe_allow_html=True)
         with c4: st.markdown(f'<div class="stat-box"><div class="stat-num">{len(pending3)}</div><div class="stat-lbl">Pending Screen</div></div>', unsafe_allow_html=True)
+        _db_c3 = {}
+        for _p3 in unique3: _db_c3[_p3.get("database","?")] = _db_c3.get(_p3.get("database","?"),0)+1
+        _db_html3 = " &nbsp;|&nbsp; ".join(f"<b>{_db}</b>: {_n}" for _db,_n in sorted(_db_c3.items()))
+        st.markdown(f'<div class="warn-box" style="color:#8b949e;">📊 Per database: {_db_html3}</div>', unsafe_allow_html=True)
+        _ae1=counts3["E1"]; _ae2=counts3["E2"]; _ae7=counts3["E7"]
+        st.markdown(f'<div class="warn-box">🤖 Auto: <b>{_ae1}</b> E1 (year {g3_year_from}–{g3_year_to}) · <b>{_ae2}</b> E2 (language) · <b>{_ae7}</b> E7 (no title)</div>', unsafe_allow_html=True)
 
         # Concept matrix topic input
         st.markdown("---")
@@ -1531,43 +1695,42 @@ with tab3:
             workers3 = st.slider("Concurrent workers", 1, 5, 3, key="g3_workers")
 
         if st.button("🚀 Generate Workbook", type="primary", use_container_width=True, key="g3_generate"):
-            need3 = [p for p in pending3 if p.get("doi","") or p.get("url","")]
+            # Only fetch papers actually missing something — skip if abstract+title+authors+keywords all present
+            need3 = [p for p in pending3
+                     if (p.get("doi","") or p.get("url",""))
+                     and not (p.get("abstract","").strip() and
+                              p.get("title","").strip() and
+                              p.get("authors","").strip() and
+                              p.get("keywords","").strip())]
+            skipped3 = len(pending3) - len(need3)
             prog3 = st.progress(0); s3 = st.empty(); d3 = st.empty()
 
             if fetch3 and need3:
                 t0 = time.time(); total3 = len(need3); found3 = done3 = 0
-                s3.markdown("🔄 **Fetching abstracts...**")
+                s3.markdown(f"🔄 **Fetching for {len(need3)} papers** (⏭️ {skipped3} already complete — skipped)")
 
                 def fetch3_one(ip):
-                    i, p = ip
-                    ab, kw = fetch_abstract_and_keywords_for_paper(p)
-                    return i, ab, kw
-                
+                    i,p = ip
+                    ab, kw, ab_src = fetch_abstract_and_keywords_for_paper(p)
+                    return i, ab, kw, ab_src
+
                 with concurrent.futures.ThreadPoolExecutor(max_workers=workers3) as ex:
-                    futs = {ex.submit(fetch3_one, (i, p)): i for i, p in enumerate(need3)}
-                
+                    futs = {ex.submit(fetch3_one,(i,p)):i for i,p in enumerate(need3)}
                     for fut in concurrent.futures.as_completed(futs):
-                        try:
-                            idx, ab, kw = fut.result()
-                        except Exception:
-                            idx = futs[fut]
-                            ab, kw = "", ""
-                
+                        idx,ab,kw,ab_src = fut.result()
                         if ab:
-                            need3[idx]["abstract"] = ab
-                            found3 += 1
-                
-                        if kw and not need3[idx].get("keywords", ""):
-                            need3[idx]["keywords"] = kw
-                
-                        done3 += 1
-                        pct = int(done3 / total3 * 100)
-                        prog3.progress(pct / 100)
-                
-                        elapsed = time.time() - t0
-                        rate = done3 / elapsed if elapsed > 0 else 1
-                        m, sec = divmod(int((total3 - done3) / rate), 60)
-                
+                            need3[idx]["abstract"]=ab
+                            need3[idx]["abstract_source"]=ab_src
+                            need3[idx]["metadata_status"]="Recovered"
+                            found3+=1
+                        else:
+                            need3[idx]["abstract_source"]=ab_src
+                            need3[idx]["metadata_status"]="Not available — manual check"
+                        if kw and not need3[idx].get("keywords",""): need3[idx]["keywords"]=kw
+                        done3+=1
+                        pct=int(done3/total3*100); prog3.progress(pct/100)
+                        elapsed=time.time()-t0; rate=done3/elapsed if elapsed>0 else 1
+                        m,sec=divmod(int((total3-done3)/rate),60)
                         d3.markdown(f"**{pct}%** · ⏱ {m}m {sec}s · ✅ {found3}/{done3}")
 
                 prog3.progress(1.0)
@@ -1595,7 +1758,6 @@ with tab3:
                 ("Source / Journal",26),("DOI",28),("URL",28),
                 ("Keywords",35),("Abstract",60),
                 ("Screening Status",14),("Exclusion Reason",20),("Notes",30),
-                ("Relevanz",12),("Themenbereich",25),("Art der Quelle",22),   # NEW
             ]
 
             def write3(ws, plist, rfn=None, start=1):
@@ -1611,8 +1773,7 @@ with tab3:
                     vals=[p.get("database",""),p.get("title",""),p.get("authors",""),
                           p.get("year",""),p.get("source","")[:60],p.get("doi",""),
                           p.get("url","")[:100],p.get("keywords",""),p.get("abstract",""),
-                          p.get("screening_status","Pending"),p.get("exclusion_reason",""),p.get("notes",""),
-                          p.get("relevanz",""),p.get("themenbereich",""),p.get("art_der_quelle","")]   # NEW
+                          p.get("screening_status","Pending"),p.get("exclusion_reason",""),p.get("notes","")]
                     for ci,val in enumerate(vals,1):
                         c=ws.cell(row=ri,column=ci,value=val)
                         c.fill=fill; c.border=BDR; c.font=Font(name="Arial",size=9)
@@ -1623,10 +1784,6 @@ with tab3:
                     ws.add_data_validation(dv1); dv1.add(f'J{start+1}:J{start+len(plist)}')
                     dv2=DataValidation(type="list",formula1='"E1,E2,E3,E4,E5,E6,E7,E8,E9,"',allow_blank=True)
                     ws.add_data_validation(dv2); dv2.add(f'K{start+1}:K{start+len(plist)}')
-                    dv3=DataValidation(type="list",formula1='"Hoch,Mittel,Niedrig"',allow_blank=True)
-                    ws.add_data_validation(dv3); dv3.add(f'M{start+1}:M{start+len(plist)}')
-                    dv4=DataValidation(type="list",formula1='"Research Article,Journal,Conference Paper,Peer Reviewed Paper,Short Paper,Other"',allow_blank=True)
-                    ws.add_data_validation(dv4); dv4.add(f'O{start+1}:O{start+len(plist)}')
 
             # Sheet 1: PRISMA
             ws_p = wb3.active; ws_p.title = "PRISMA_Flow"
@@ -1647,7 +1804,7 @@ with tab3:
                 ["Identification","Records identified",len(all_papers3),"","From all uploaded files"],
                 ["Identification","Duplicates removed",len(dupes3),"",""],
                 ["Identification","After deduplication",len(unique3),"",""],
-                ["Screening",f"Auto E1 (invalid year)",counts3["E1"],"","Auto-detected"],
+                ["Screening",f"Auto E1 (year outside {g3_year_from}-{g3_year_to})",counts3["E1"],"","Auto-detected"],
                 ["Screening",f"Auto E2 (not English)",counts3["E2"],"","Auto-detected"],
                 ["Screening",f"Auto E7 (missing data)",counts3["E7"],"","Auto-detected"],
                 ["Screening","Pending manual screening",len(pending3),"","See Screening_Sheet"],
